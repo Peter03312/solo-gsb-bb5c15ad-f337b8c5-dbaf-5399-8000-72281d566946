@@ -56,6 +56,50 @@ function initSchema() {
   CREATE INDEX IF NOT EXISTS idx_versions_scenario ON versions(scenario_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_scenario ON sessions(scenario_id);
   -- 注：idx_sessions_root 在下方迁移补列之后再创建（老库此时尚无 root_code 列）
+
+  -- 共识演练房间：一个房间绑定一条共享会话（同一条会话路径），
+  -- 房间本身只记录冻结版本绑定与凭证，当前步号/状态一律以绑定会话为准。
+  CREATE TABLE IF NOT EXISTS rooms (
+    code            TEXT PRIMARY KEY,        -- 房间码，即学员加入码
+    host_token      TEXT NOT NULL UNIQUE,    -- 主持凭证（结算时出示）
+    scenario_id     TEXT NOT NULL,
+    version         INTEGER NOT NULL,        -- 开启时选定的已发布冻结版本；后续发布不影响本场
+    session_code    TEXT NOT NULL REFERENCES sessions(code) ON DELETE CASCADE,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS room_members (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_code       TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
+    member_token    TEXT NOT NULL UNIQUE,    -- 成员凭证（投票时出示）
+    name            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 投票：主键 (房间, 步号, 成员) 保证“每人每步只计最后一票”（改票即 UPSERT）
+  CREATE TABLE IF NOT EXISTS room_votes (
+    room_code       TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
+    step_no         INTEGER NOT NULL,
+    member_token    TEXT NOT NULL,
+    option_id       TEXT NOT NULL,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (room_code, step_no, member_token)
+  );
+
+  -- 结算留痕：主键 (房间, 步号) 防并发重复结算；tallies 为该步各可选项票数快照
+  CREATE TABLE IF NOT EXISTS room_settlements (
+    room_code       TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
+    step_no         INTEGER NOT NULL,        -- 被结算的步号（推进前的当前步）
+    option_id       TEXT NOT NULL,           -- 获胜选项
+    tallies         TEXT NOT NULL,           -- JSON: [{optionId, optionLabel, votes}]
+    voter_count     INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (room_code, step_no)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_room_members_room ON room_members(room_code);
+  CREATE INDEX IF NOT EXISTS idx_room_votes_room ON room_votes(room_code, step_no);
   `);
 
   // 老库迁移：补入复盘分叉所需的溯源列
@@ -66,9 +110,12 @@ function initSchema() {
   addColumn('parent_code', 'parent_code TEXT');
   addColumn('fork_step_no', 'fork_step_no INTEGER');
   addColumn('root_code', 'root_code TEXT');
+  // 共识演练：房间绑定的共享会话打上 room_code 标记，单人选择入口据此拒绝绕过投票
+  addColumn('room_code', 'room_code TEXT');
   // 存量会话（含建表后尚未回填 root_code 的库）：无溯源信息即为原始会话，根是自身
   db.exec(`UPDATE sessions SET root_code = code WHERE root_code IS NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_code)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_room ON sessions(room_code)`);
 }
 
 function newId(prefix) {

@@ -346,6 +346,30 @@ code { background: #eef2f6; padding: 1px 6px; border-radius: 4px; font-size: 12p
 .cov-count.has b { color: var(--brand-dark); font-size: 15px; }
 .cov-count code { margin: 2px 3px 0 0; display: inline-block; }
 
+/* ---------- 共识演练房间 ---------- */
+.rooms-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.room-created {
+  margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--brand);
+  border-radius: 8px; background: #f4f9ff; display: grid; gap: 6px; font-size: 13px;
+}
+.big-code {
+  font-size: 15px; font-weight: 700; letter-spacing: .5px;
+  background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+  user-select: all;
+}
+.room-opt { position: relative; padding-right: 64px; }
+.vote-badge {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  background: #eef1f4; color: var(--muted); font-size: 12px; font-weight: 700;
+  padding: 2px 9px; border-radius: 999px; white-space: nowrap;
+}
+.option-btn.my-vote { border-color: var(--brand); box-shadow: 0 0 0 2px rgba(37, 99, 235, .18); }
+.option-btn.my-vote .vote-badge { background: var(--brand); color: #fff; }
+.my-vote-tag { display: block; font-size: 11px; color: var(--brand); font-weight: 700; margin-top: 3px; }
+.vote-detail { margin: 0 0 10px; padding-left: 20px; font-size: 13px; }
+.vote-detail li { margin: 2px 0; }
+hr.sep { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed;

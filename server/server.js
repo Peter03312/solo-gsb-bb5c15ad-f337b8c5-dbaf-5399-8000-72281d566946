@@ -17,6 +17,7 @@ const {
 } = require('./scenario');
 const { buildSnapshot, performMove, forkSession, loadLineage, computeTotalScore } = require('./session');
 const { buildCoverageReport } = require('./coverage');
+const roomOps = require('./room');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'app.db');
@@ -269,7 +270,7 @@ app.get('/api/sessions', (req, res) => {
   const rows = db.prepare(`
     SELECT se.code, se.scenario_id, s.title AS scenario_title, se.version, se.status,
            se.step_no, se.trainee_name, se.current_node_id, se.created_at, se.updated_at,
-           se.parent_code, se.fork_step_no, se.root_code, se.path
+           se.parent_code, se.fork_step_no, se.root_code, se.room_code, se.path
       FROM sessions se JOIN scenarios s ON s.id = se.scenario_id
      ORDER BY se.updated_at DESC LIMIT 200
   `).all();
@@ -417,6 +418,104 @@ app.get('/api/scenarios/:id/versions/:version/coverage', (req, res) => {
     });
   }
   res.json(result.report);
+});
+
+// ---------- 共识演练房间（多人投票推进同一条会话路径） ----------
+
+// 开启房间（培训师）：{scenarioId, version?}。version 缺省为当前最新发布版；
+// 房间绑定该冻结版本，后续发布新版本不改变本场规则。
+// 成功返回房间码（即学员加入码）与主持凭证。
+app.post('/api/rooms', (req, res) => {
+  const { scenarioId, version } = req.body || {};
+  if (!scenarioId) return res.status(400).json({ error: '缺少 scenarioId' });
+  const result = roomOps.createRoom(db, { scenarioId, version });
+  if (!result.ok) return res.status(result.status).json({ error: result.error, errorCode: result.errorCode });
+  res.status(201).json({
+    ok: true,
+    code: result.room.code,
+    joinCode: result.room.code, // 学员加入码（即房间码）
+    hostToken: result.hostToken, // 主持凭证（结算时出示，请妥善保存）
+    scenarioId: result.room.scenario_id,
+    scenarioTitle: result.scenarioTitle,
+    version: result.room.version,
+    sessionCode: result.room.session_code,
+    note: '房间已绑定该冻结版本，后续发布新版本不影响本场规则；学员凭加入码取得成员凭证后投票，主持人凭主持凭证结算。',
+  });
+});
+
+// 最近房间列表（不暴露凭证与投票明细）
+app.get('/api/rooms', (req, res) => {
+  res.json(roomOps.listRooms(db));
+});
+
+// 房间现状：当前步号、可选处置与聚合票数、已结算路径、累计分。
+// 可选凭证：query 参数 memberToken / hostToken（或 x-member-token / x-host-token 请求头）。
+// 成员凭证附加 myVote；主持凭证附加逐人投票明细与成员名单；未结算前学员看不到他人选票。
+app.get('/api/rooms/:code', (req, res) => {
+  const viewer = {};
+  const mt = req.query.memberToken || req.get('x-member-token');
+  const ht = req.query.hostToken || req.get('x-host-token');
+  if (mt) viewer.memberToken = String(mt);
+  if (ht) viewer.hostToken = String(ht);
+  const room = roomOps.getRoom(db, req.params.code);
+  if (!room) return res.status(404).json({ error: '房间不存在', errorCode: 'ROOM_NOT_FOUND' });
+  const result = roomOps.buildRoomSnapshot(db, room, viewer);
+  if (!result.ok) return res.status(result.status).json({ error: result.error, errorCode: result.errorCode });
+  res.json({ ok: true, ...result.snapshot });
+});
+
+// 学员加入：{name?} → 成员凭证
+app.post('/api/rooms/:code/join', (req, res) => {
+  const { name } = req.body || {};
+  const result = roomOps.joinRoom(db, { code: req.params.code, name });
+  if (!result.ok) return res.status(result.status).json({ error: result.error, errorCode: result.errorCode });
+  res.status(201).json({
+    ok: true,
+    memberToken: result.memberToken,
+    memberName: result.memberName,
+    room: result.snapshot,
+  });
+});
+
+// 学员投票/改票：{memberToken, optionId, stepNo}。每人每步只计最后一票；
+// 过期步号/无效凭证/条件不符/已结束一律返回原因及当前步号，不改变票数。
+app.post('/api/rooms/:code/vote', (req, res) => {
+  const { memberToken, optionId, stepNo } = req.body || {};
+  if (typeof memberToken !== 'string' || !memberToken) {
+    return res.status(400).json({ error: '缺少 memberToken（成员凭证）' });
+  }
+  if (typeof optionId !== 'string') return res.status(400).json({ error: '缺少 optionId' });
+  if (!Number.isInteger(stepNo)) return res.status(400).json({ error: '缺少或非法的 stepNo（必须为整数）' });
+  const result = roomOps.castVote(db, { code: req.params.code, memberToken, optionId, stepNo });
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      errorCode: result.errorCode,
+      current: result.current || null,
+    });
+  }
+  res.json({ ok: true, myVote: { optionId }, current: result.snapshot });
+});
+
+// 主持人结算：{hostToken, observedStepNo}。票数最多的选项推进共享会话，
+// 同票按冻结版本的选项编排顺序；无人投票不得结算；过期步号拒绝并返回当前步号。
+app.post('/api/rooms/:code/settle', (req, res) => {
+  const { hostToken, observedStepNo } = req.body || {};
+  if (typeof hostToken !== 'string' || !hostToken) {
+    return res.status(400).json({ error: '缺少 hostToken（主持凭证）' });
+  }
+  if (!Number.isInteger(observedStepNo)) {
+    return res.status(400).json({ error: '缺少或非法的 observedStepNo（必须为整数）' });
+  }
+  const result = roomOps.settleRoom(db, { code: req.params.code, hostToken, observedStepNo });
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      errorCode: result.errorCode,
+      current: result.current || null,
+    });
+  }
+  res.json({ ok: true, settled: result.settled, current: result.snapshot });
 });
 
 // 兜底：未匹配的 /api 返回 JSON 404

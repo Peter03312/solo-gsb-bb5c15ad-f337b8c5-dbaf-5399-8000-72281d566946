@@ -53,8 +53,11 @@ $$('.tab').forEach((tab) => {
     const which = tab.dataset.tab;
     $('#view-trainee').hidden = which !== 'trainee';
     $('#view-trainer').hidden = which !== 'trainer';
+    $('#view-rooms').hidden = which !== 'rooms';
     if (which === 'trainee') { loadPublished(); loadSessionList(); }
+    if (which === 'rooms') { leaveRoomView(); loadRoomHome(); }
     if (which === 'trainer') {
+      leaveRoomView();
       coverageCtx = null;
       $('#trainer-coverage').hidden = true;
       $('#trainer-editor').hidden = true;
@@ -119,9 +122,11 @@ async function loadSessionList() {
             <td class="${s.status === 'active' ? 'status-active' : 'status-ended'}">${s.status === 'active' ? '进行中' : '已结局'}</td>
             <td>${s.step_no}</td>
             <td><b class="${scoreClass(s.total_score || 0)}">${s.total_score || 0}</b></td>
-            <td>${s.parent_code
-              ? `分支↩<code data-lineage-jump="${esc(s.parent_code)}" title="查看源会话">${esc(s.parent_code)}</code>@${s.fork_step_no}步`
-              : '<span class="muted">原始</span>'}</td>
+            <td>${s.room_code
+              ? `<span title="共识演练房间的共享会话，须经房间投票结算推进">🗳️ 房间 <code>${esc(s.room_code)}</code></span>`
+              : (s.parent_code
+                ? `分支↩<code data-lineage-jump="${esc(s.parent_code)}" title="查看源会话">${esc(s.parent_code)}</code>@${s.fork_step_no}步`
+                : '<span class="muted">原始</span>')}</td>
             <td>${esc(s.trainee_name || '—')}</td>
             <td class="ses-actions">
               <button class="btn sm" data-resume="${esc(s.code)}">${s.status === 'active' ? '继续' : '查看'}</button>
@@ -1022,6 +1027,314 @@ function renderCoverageItems(r) {
       </tbody>
     </table>`;
 }
+
+// ====================== 共识演练（房间投票） ======================
+
+// 房间凭证按房间码存 localStorage：{ [code]: { memberToken?, hostToken?, name? } }
+function roomCreds() {
+  try { return JSON.parse(localStorage.getItem('roomCreds') || '{}'); } catch (_) { return {}; }
+}
+function saveRoomCred(code, patch) {
+  const all = roomCreds();
+  all[code] = { ...(all[code] || {}), ...patch };
+  localStorage.setItem('roomCreds', JSON.stringify(all));
+}
+function getRoomCred(code) {
+  return roomCreds()[code] || {};
+}
+
+// 当前打开的房间视图上下文：{ code, memberToken, hostToken, data, timer }
+let roomCtx = null;
+
+async function loadRoomHome() {
+  $('#rooms-home').hidden = false;
+  $('#room-view').hidden = true;
+  // 已发布情境供开启房间选择
+  try {
+    const list = await api('/api/published');
+    const sel = $('#room-scenario');
+    sel.innerHTML = list.length
+      ? list.map((s) => `<option value="${esc(s.id)}">${esc(s.title)}（当前 v${s.current_version}）</option>`).join('')
+      : '<option value="">（暂无已发布情境）</option>';
+    await loadRoomVersions();
+  } catch (err) { toast(err.message, 'err'); }
+  await loadRoomList();
+}
+
+async function loadRoomVersions() {
+  const id = $('#room-scenario').value;
+  const sel = $('#room-version');
+  if (!id) { sel.innerHTML = ''; return; }
+  try {
+    const detail = await api(`/api/scenarios/${encodeURIComponent(id)}`);
+    const versions = (detail.versions || []).slice().sort((a, b) => b.version - a.version);
+    sel.innerHTML = versions.map((v) =>
+      `<option value="${v.version}">v${v.version}（冻结于 ${fmtTime(v.created_at)}）</option>`).join('');
+  } catch (err) { sel.innerHTML = ''; }
+}
+
+$('#room-scenario').addEventListener('change', loadRoomVersions);
+$('#btn-reload-rooms').addEventListener('click', loadRoomHome);
+
+$('#btn-create-room').addEventListener('click', async () => {
+  const scenarioId = $('#room-scenario').value;
+  const version = parseInt($('#room-version').value, 10);
+  if (!scenarioId) return toast('请先选择已发布情境', 'err');
+  if (!Number.isInteger(version)) return toast('请选择冻结版本', 'err');
+  try {
+    const r = await api('/api/rooms', { method: 'POST', body: { scenarioId, version } });
+    saveRoomCred(r.code, { hostToken: r.hostToken });
+    $('#room-created').classList.remove('hidden');
+    $('#room-join-out').textContent = r.joinCode;
+    $('#room-host-out').textContent = r.hostToken;
+    toast(`房间已开启（绑定 v${r.version}），把加入码发给学员`, 'ok');
+    loadRoomList();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+$('#btn-enter-host').addEventListener('click', () => {
+  const code = $('#room-join-out').textContent.trim();
+  const cred = getRoomCred(code);
+  if (code && cred.hostToken) enterRoom(code, { hostToken: cred.hostToken });
+});
+
+$('#btn-join-room').addEventListener('click', async () => {
+  const code = $('#join-code').value.trim();
+  const name = $('#join-name').value.trim();
+  if (!code) return toast('请输入加入码', 'err');
+  try {
+    const r = await api(`/api/rooms/${encodeURIComponent(code)}/join`, { method: 'POST', body: { name } });
+    saveRoomCred(code, { memberToken: r.memberToken, name: r.memberName || '' });
+    toast('已加入房间，可以对当前步投票了', 'ok');
+    enterRoom(code, { memberToken: r.memberToken });
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+$('#btn-enter-host-manual').addEventListener('click', () => {
+  const code = $('#host-code').value.trim();
+  const hostToken = $('#host-token').value.trim();
+  if (!code || !hostToken) return toast('请输入房间码与主持凭证', 'err');
+  saveRoomCred(code, { hostToken });
+  enterRoom(code, { hostToken });
+});
+
+async function loadRoomList() {
+  const box = $('#room-list');
+  try {
+    const list = await api('/api/rooms');
+    if (!list.length) { box.innerHTML = '<div class="muted">还没有房间。培训师可在上方开启共识演练。</div>'; return; }
+    box.innerHTML = `
+      <table class="ses-table">
+        <thead><tr><th>房间码</th><th>情境</th><th>版本</th><th>状态</th><th>当前步</th><th>成员</th><th>开启时间</th><th></th></tr></thead>
+        <tbody>
+          ${list.map((r) => {
+            const cred = getRoomCred(r.code);
+            return `<tr>
+              <td><code>${esc(r.code)}</code></td>
+              <td>${esc(r.scenario_title)}</td>
+              <td>v${r.version}</td>
+              <td class="${r.status === 'active' ? 'status-active' : 'status-ended'}">${r.status === 'active' ? '进行中' : '已结束'}</td>
+              <td>${r.step_no}</td>
+              <td>${r.member_count}</td>
+              <td>${fmtTime(r.created_at)}</td>
+              <td class="ses-actions">
+                ${cred.hostToken ? `<button class="btn sm" data-room-host="${esc(r.code)}">🎤 主持台</button>` : ''}
+                ${cred.memberToken ? `<button class="btn sm" data-room-member="${esc(r.code)}">🙋 我的投票</button>` : ''}
+                <button class="btn sm ghost" data-room-watch="${esc(r.code)}">围观</button>
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  } catch (err) { box.innerHTML = `<div class="muted">房间列表加载失败：${esc(err.message)}</div>`; }
+}
+
+$('#room-list').addEventListener('click', (e) => {
+  const host = e.target.closest('[data-room-host]');
+  const member = e.target.closest('[data-room-member]');
+  const watch = e.target.closest('[data-room-watch]');
+  if (host) enterRoom(host.dataset.roomHost, { hostToken: getRoomCred(host.dataset.roomHost).hostToken });
+  else if (member) enterRoom(member.dataset.roomMember, { memberToken: getRoomCred(member.dataset.roomMember).memberToken });
+  else if (watch) enterRoom(watch.dataset.roomWatch, {});
+});
+
+// 进入房间视图并启动轮询（多人协作需要看到票数/步号变化）
+function enterRoom(code, cred) {
+  leaveRoomView();
+  roomCtx = {
+    code,
+    memberToken: cred.memberToken || null,
+    hostToken: cred.hostToken || null,
+    data: null,
+    timer: null,
+  };
+  $('#rooms-home').hidden = true;
+  $('#room-view').hidden = false;
+  refreshRoom();
+  roomCtx.timer = setInterval(refreshRoom, 2500);
+}
+
+function leaveRoomView() {
+  if (roomCtx && roomCtx.timer) clearInterval(roomCtx.timer);
+  roomCtx = null;
+}
+
+$('#btn-exit-room').addEventListener('click', () => {
+  leaveRoomView();
+  $('#room-view').hidden = true;
+  $('#rooms-home').hidden = false;
+  loadRoomHome();
+});
+
+function roomQuery() {
+  const q = [];
+  if (roomCtx.memberToken) q.push(`memberToken=${encodeURIComponent(roomCtx.memberToken)}`);
+  if (roomCtx.hostToken) q.push(`hostToken=${encodeURIComponent(roomCtx.hostToken)}`);
+  return q.length ? `?${q.join('&')}` : '';
+}
+
+async function refreshRoom() {
+  if (!roomCtx) return;
+  try {
+    const data = await api(`/api/rooms/${encodeURIComponent(roomCtx.code)}${roomQuery()}`);
+    roomCtx.data = data;
+    renderRoom();
+  } catch (err) {
+    if (err.status === 404 || err.status === 401) {
+      leaveRoomView();
+      $('#room-view').hidden = true;
+      $('#rooms-home').hidden = false;
+      loadRoomHome();
+      toast(err.message, 'err');
+    }
+    // 其它瞬时错误（网络抖动等）静默，等待下一轮轮询
+  }
+}
+
+function renderRoom() {
+  const d = roomCtx.data;
+  if (!d) return;
+  $('#room-scenario-title').textContent = `${d.scenarioTitle || ''}`;
+  $('#room-code').textContent = d.code;
+  $('#room-version').textContent = 'v' + d.version;
+  $('#room-step').textContent = d.stepNo;
+  $('#room-score').textContent = d.totalScore;
+  $('#room-score').className = scoreClass(d.totalScore);
+  $('#room-members').textContent = d.memberCount;
+  $('#room-votes').textContent = d.totalVotes;
+  $('#room-role').innerHTML = d.isHost
+    ? ' · <span class="badge v">🎤 主持人</span>'
+    : (d.myVote !== null || roomCtx.memberToken ? ' · <span class="badge draft">🙋 学员</span>' : ' · <span class="muted">👀 围观（加入房间后可投票）</span>');
+
+  const node = d.currentNode;
+  $('#room-node-kick').textContent = node && node.isEnd ? '结局' : '当前情境';
+  $('#room-node-title').textContent = node ? node.title : '（节点缺失）';
+  $('#room-node-narrative').textContent = node && node.narrative ? node.narrative : '';
+
+  $('#room-state-list').innerHTML = d.states.map((st) => `
+    <div class="state-row">
+      <span>${esc(st.name)}</span>
+      <span class="state-val ${st.value ? 'yes' : 'no'}">${st.value ? '● 是' : '○ 否'}</span>
+    </div>`).join('');
+
+  // 选项（带聚合票数；未结算时学员看不到他人选票，只有总数）
+  const optBox = $('#room-option-list');
+  if (d.status === 'ended') {
+    optBox.innerHTML = '<div class="muted">本场共识演练已结束。</div>';
+    roomBanner(`演练结束：已到达结局「${node ? node.title : ''}」，共 ${d.stepNo} 步，总分 <b>${d.totalScore}</b> 分。`, 'ok');
+  } else {
+    const myOpt = d.myVote && d.myVote.optionId;
+    const canVote = !!roomCtx.memberToken;
+    const avail = d.options.map((o) => `
+      <button class="option-btn room-opt ${myOpt === o.id ? 'my-vote' : ''}" data-vote="${esc(o.id)}" ${canVote ? '' : 'disabled'}>
+        ${esc(o.label)}
+        <span class="vote-badge" title="本选项当前票数">${o.votes} 票</span>
+        ${myOpt === o.id ? '<span class="my-vote-tag">✓ 我的投票</span>' : ''}
+        ${o.conditions.length ? `<span class="conds">条件：${o.conditions.map((c) => condText(d, c)).join('；')}</span>` : ''}
+      </button>`).join('');
+    const unavail = (d.unavailableOptions || []).map((o) => `
+      <button class="option-btn disabled-opt" disabled>
+        🔒 ${esc(o.label)}
+        <span class="vote-badge">${o.votes} 票</span>
+        <span class="lock">${esc(o.reason)}：${o.failingConditions.map((f) => `${esc(f.stateName)} 需为「${f.required ? '是' : '否'}」`).join('；')}</span>
+      </button>`).join('');
+    optBox.innerHTML = (avail || '<div class="muted">当前没有可投选项。</div>') + unavail
+      + (canVote ? '' : '<div class="hint" style="margin-top:6px">你正以围观身份查看；用加入码加入房间后才能投票。</div>');
+  }
+
+  // 主持台：逐人投票明细 + 结算
+  const hostPanel = $('#room-host-panel');
+  if (d.isHost && d.status === 'active') {
+    hostPanel.hidden = false;
+    const votes = d.votes || [];
+    $('#room-vote-detail').innerHTML = `
+      <div class="muted" style="margin-bottom:6px">成员 ${d.memberCount} 人，本步已投 ${d.totalVotes} 票${votes.length ? '：' : '。'}</div>
+      ${votes.length ? `<ul class="vote-detail">${votes.map((v) => {
+        const opt = d.options.find((o) => o.id === v.optionId);
+        return `<li>${esc(v.name)} → 「${esc(opt ? opt.label : v.optionId)}」</li>`;
+      }).join('')}</ul>` : ''}`;
+    $('#btn-settle').disabled = d.totalVotes === 0;
+  } else {
+    hostPanel.hidden = true;
+  }
+
+  // 已结算路径（每步得分 + 当步票数）
+  const settleByStep = new Map((d.settlements || []).map((s) => [s.stepNo + 1, s]));
+  $('#room-path-list').innerHTML = d.path.map((p) => {
+    const st = settleByStep.get(p.step);
+    const tallyText = st
+      ? `<span class="pl-sub">当场票数：${st.tallies.map((t) => `「${esc(t.optionLabel)}」${t.votes}票`).join('，')}（共 ${st.voterCount} 人投票）</span>`
+      : '';
+    return renderPathItem(p, d) + tallyText;
+  }).join('') || '<li class="muted">尚未结算任何一步。</li>';
+}
+
+function roomBanner(msg, kind) {
+  const b = $('#room-banner');
+  b.innerHTML = msg;
+  b.className = 'banner ' + kind;
+}
+
+// 学员投票 / 改票（携带当前所见步号；过期则服务器拒绝并返回当前步号）
+$('#room-option-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-vote]');
+  if (!btn || !roomCtx || !roomCtx.memberToken || !roomCtx.data) return;
+  if (roomCtx.data.status !== 'active') return;
+  try {
+    const r = await api(`/api/rooms/${encodeURIComponent(roomCtx.code)}/vote`, {
+      method: 'POST',
+      body: { memberToken: roomCtx.memberToken, optionId: btn.dataset.vote, stepNo: roomCtx.data.stepNo },
+    });
+    roomCtx.data = r.current;
+    renderRoom();
+    roomBanner('已计票（结算前可改票，只计最后一票）。', 'ok');
+  } catch (err) {
+    if (err.data && err.data.current) { roomCtx.data = err.data.current; renderRoom(); }
+    roomBanner(`投票被拒绝：${esc(err.message)}`, 'error');
+  }
+});
+
+// 主持人结算（携带所见步号；步号过期/无人投票会被拒绝并刷新现状）
+$('#btn-settle').addEventListener('click', async () => {
+  if (!roomCtx || !roomCtx.hostToken || !roomCtx.data) return;
+  try {
+    const r = await api(`/api/rooms/${encodeURIComponent(roomCtx.code)}/settle`, {
+      method: 'POST',
+      body: { hostToken: roomCtx.hostToken, observedStepNo: roomCtx.data.stepNo },
+    });
+    roomCtx.data = r.current;
+    renderRoom();
+    const s = r.settled;
+    const sign = s.score > 0 ? '+' : '';
+    roomBanner(
+      `第 ${s.stepNo} 步已按投票结算：「${esc(s.optionLabel)}」胜出（${s.tallies.map((t) => `「${esc(t.optionLabel)}」${t.votes}票`).join('，')}），`
+      + `本步得分 ${sign}${s.score}，累计 ${s.totalScore} 分。`,
+      'ok');
+  } catch (err) {
+    if (err.data && err.data.current) { roomCtx.data = err.data.current; renderRoom(); }
+    roomBanner(`结算被拒绝：${esc(err.message)}`, 'error');
+  }
+});
 
 // ====================== 初始化 ======================
 

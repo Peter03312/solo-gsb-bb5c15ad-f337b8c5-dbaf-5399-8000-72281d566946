@@ -88,6 +88,7 @@ function buildSnapshot(content, session, scenarioId, version) {
     path: pathView,
     traineeName: session.trainee_name || null,
     startedAt: session.created_at,
+    roomCode: session.room_code || null, // 非空表示该会话是共识演练房间的共享会话
     lineage: {
       rootCode: session.root_code || session.code,
       parentCode: session.parent_code || null,
@@ -114,8 +115,10 @@ function computeTotalScore(content, pathRows) {
  * 执行一步选择。不写库，返回 {ok, error, session}（供事务内调用）。
  * 校验：会话存在/未结束、步号严格匹配当前步号（防过期/重复提交）、
  *       选项属于当前节点、条件满足。任何不满足都不推进。
+ * 房间会话（room_code 非空）属于共识演练，必须经“成员投票 + 主持人结算”推进；
+ * 仅房间结算内部调用时传 allowRoomSession: true 放行。
  */
-function performMove(db, { code, optionId, stepNo, traineeName }) {
+function performMove(db, { code, optionId, stepNo, traineeName, allowRoomSession = false }) {
   const session = db.prepare('SELECT * FROM sessions WHERE code = ?').get(code);
   if (!session) {
     return { ok: false, status: 404, errorCode: 'SESSION_NOT_FOUND', error: '会话不存在' };
@@ -136,6 +139,10 @@ function performMove(db, { code, optionId, stepNo, traineeName }) {
     current: buildSnapshot(content, session, session.scenario_id, session.version),
   });
 
+  if (session.room_code && !allowRoomSession) {
+    return fail(409, 'ROOM_SOLO_MOVE_FORBIDDEN',
+      `该会话属于共识演练房间 ${session.room_code}，须由成员投票、主持人结算推进，不能经单人选择入口操作（未推进）`);
+  }
   if (session.status !== 'active') {
     return fail(409, 'SESSION_ENDED', '该会话已结束，不能继续选择');
   }
