@@ -3,7 +3,7 @@
 const path = require('path');
 const express = require('express');
 
-const { open, newId, newSessionCode } = require('./db');
+const { open, newId, newSessionCode, newRoomCode, newSecretToken } = require('./db');
 const { seed } = require('./seed');
 const {
   normalizeDraft,
@@ -17,6 +17,7 @@ const {
 } = require('./scenario');
 const { buildSnapshot, performMove, forkSession, loadLineage, computeTotalScore } = require('./session');
 const { buildCoverageReport } = require('./coverage');
+const roomCore = require('./room');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'app.db');
@@ -297,6 +298,14 @@ app.get('/api/sessions', (req, res) => {
 
 // 查询会话现状
 app.get('/api/sessions/:code', (req, res) => {
+  // 房间码不属于单人会话命名空间：引导到房间状态接口
+  if (isRoomCode(req.params.code)) {
+    return res.status(404).json({
+      error: '该码是共识演练房间码（非单人会话码），请使用 /api/rooms/:code/state 查询房间状态',
+      errorCode: 'CONSENSUS_ROOM_NOT_SOLO',
+      current: roomCore.buildRoomState(db, roomCore.getRoom(db, req.params.code), null).state,
+    });
+  }
   const session = db.prepare('SELECT * FROM sessions WHERE code = ?').get(req.params.code);
   if (!session) return res.status(404).json({ error: '会话不存在' });
   const versionRow = db.prepare('SELECT content FROM versions WHERE scenario_id = ? AND version = ?')
@@ -315,6 +324,15 @@ app.post('/api/sessions/:code/move', (req, res) => {
   const { optionId, stepNo, traineeName } = req.body || {};
   if (typeof optionId !== 'string') return res.status(400).json({ error: '缺少 optionId' });
   if (!Number.isInteger(stepNo)) return res.status(400).json({ error: '缺少或非法的 stepNo（必须为整数）' });
+
+  // 共识演练房间只能走“投票—主持结算”流程，不得经单人选择入口绕过
+  if (isRoomCode(req.params.code)) {
+    return res.status(409).json({
+      error: '该码属于共识演练房间（非单人会话）：房间的每一步必须由学员投票、主持人结算，不能在此直接选择',
+      errorCode: 'CONSENSUS_ROOM_NOT_SOLO',
+      current: roomCore.buildRoomState(db, roomCore.getRoom(db, req.params.code), null).state,
+    });
+  }
 
   const result = performMove(db, { code: req.params.code, optionId, stepNo, traineeName });
   if (!result.ok) {
@@ -358,6 +376,15 @@ app.post('/api/sessions/:code/fork', (req, res) => {
     return res.status(400).json({ error: '缺少或非法的 observedStepNo（所见源当前步号必须为整数）' });
   }
 
+  // 房间会话不得经复盘分叉入口被拆成单人会话（房间不属于 sessions 家族体系）
+  if (isRoomCode(req.params.code)) {
+    return res.status(409).json({
+      error: '该码属于共识演练房间（非单人会话）：房间沿同一条经投票结算的路径推进，不能在此分叉',
+      errorCode: 'CONSENSUS_ROOM_NOT_SOLO',
+      current: roomCore.buildRoomState(db, roomCore.getRoom(db, req.params.code), null).state,
+    });
+  }
+
   // 会话码随机碰撞时极小概率重试
   for (let attempt = 0; attempt < 3; attempt++) {
     const newCode = newSessionCode();
@@ -397,6 +424,190 @@ app.get('/api/sessions/:code/lineage', (req, res) => {
   const result = loadLineage(db, req.params.code);
   if (!result.ok) return res.status(result.status).json({ error: result.error });
   res.json({ ok: true, rootCode: result.rootCode, requestedCode: result.requestedCode, tree: result.tree });
+});
+
+// ---------- 共识演练房间 ----------
+
+// 凭证可经请求头或请求体 / 查询参数传递（curl 与浏览器均方便）
+function hostTokenOf(req, body) {
+  return req.get('X-Room-Host-Token') || (body && body.hostToken) || req.query.hostToken || '';
+}
+function memberTokenOf(req, body) {
+  return req.get('X-Room-Member-Token') || (body && body.memberToken) || req.query.memberToken || '';
+}
+
+// 房间码 / 单人会话码共用命名空间：任一入口拿到码，先判断它是不是房间码
+function isRoomCode(code) {
+  return !!roomCore.getRoom(db, code);
+}
+
+// 培训师开启共识演练：锁定一个已发布冻结版本，取得主持凭证与学员加入码
+app.post('/api/rooms', (req, res) => {
+  const { scenarioId, version, hostName } = req.body || {};
+  const result = roomCore.createRoom(db, { scenarioId, version, hostName },
+    { newRoomCode, newSecretToken });
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error, errorCode: result.errorCode });
+  }
+  const sc = db.prepare('SELECT title FROM scenarios WHERE id = ?').get(result.room.scenario_id);
+  res.status(201).json({
+    ok: true,
+    room: {
+      code: result.code,
+      scenarioId: result.room.scenario_id,
+      scenarioTitle: sc ? sc.title : null,
+      version: result.version,
+      hostName: result.room.host_name || null,
+      status: result.room.status,
+      stepNo: 0,
+      createdAt: result.room.created_at,
+    },
+    // 主持凭证只在创建时完整返回一次，请培训师妥善保存
+    hostToken: result.hostToken,
+    joinCode: result.code,
+  });
+});
+
+// 房间列表：持主持凭证返回该主持的房间（也可用 ?hostToken= 查询）；
+// 无凭证不返回房间清单。
+app.get('/api/rooms', (req, res) => {
+  const token = hostTokenOf(req, null);
+  if (!roomCore.tokenPresent(token)) {
+    return res.status(400).json({ error: '缺少主持凭证，无法列出房间', errorCode: 'HOST_TOKEN_REQUIRED' });
+  }
+  const rows = db.prepare(`
+    SELECT r.code, r.scenario_id, s.title AS scenario_title, r.version, r.status,
+           r.step_no, r.host_name, r.created_at, r.updated_at,
+           (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.code) AS member_count
+      FROM rooms r JOIN scenarios s ON s.id = r.scenario_id
+     ORDER BY r.updated_at DESC LIMIT 200
+  `).all();
+  const out = [];
+  for (const r of rows) {
+    const room = roomCore.getRoom(db, r.code);
+    if (roomCore.tokenEqual(room.host_token, token)) {
+      out.push({
+        code: r.code,
+        scenarioId: r.scenario_id,
+        scenarioTitle: r.scenario_title,
+        version: r.version,
+        status: r.status,
+        stepNo: r.step_no,
+        hostName: r.host_name,
+        memberCount: r.member_count,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      });
+    }
+  }
+  res.json({ rooms: out });
+});
+
+// 房间公开摘要（未鉴权）：学员凭加入码查看“是否已开始/已结束、第几步、几人加入”
+app.get('/api/rooms/:code', (req, res, next) => {
+  const room = roomCore.getRoom(db, req.params.code);
+  if (!room) return next(); // 可能是单人会话码：交给后续 /api 兜底返回 404
+  res.json(roomCore.buildRoomState(db, room, null).state);
+});
+
+// 学员加入：POST /api/rooms/:code/join {name} -> 201 {joinCode, memberToken, room}
+app.post('/api/rooms/:code/join', (req, res) => {
+  const result = roomCore.joinRoom(db, req.params.code, (req.body || {}).name, newSecretToken);
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      errorCode: result.errorCode,
+      room: result.publicState || null,
+    });
+  }
+  res.status(201).json({
+    ok: true,
+    joinCode: req.params.code,
+    memberToken: result.member.token,
+    memberName: result.member.name,
+    memberId: result.member.id,
+    room: result.state,
+  });
+});
+
+// 主持台 / 学员台：持相应凭证返回带视角的完整房间状态
+app.get('/api/rooms/:code/state', (req, res) => {
+  const room = roomCore.getRoom(db, req.params.code);
+  if (!room) return res.status(404).json({ error: '房间不存在', errorCode: 'ROOM_NOT_FOUND' });
+  const hostToken = hostTokenOf(req, null);
+  const mToken = memberTokenOf(req, null);
+  let viewer;
+  if (roomCore.tokenPresent(hostToken)) {
+    const auth = roomCore.authorizeHost(db, room, hostToken);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error, errorCode: auth.errorCode });
+    viewer = auth.viewer;
+  } else if (roomCore.tokenPresent(mToken)) {
+    const auth = roomCore.authorizeMember(db, room, mToken);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error, errorCode: auth.errorCode });
+    viewer = auth.viewer;
+  } else {
+    // 未带凭证等价于公开摘要
+    return res.json(roomCore.buildRoomState(db, room, null).state);
+  }
+  const r = roomCore.buildRoomState(db, room, viewer);
+  const sc = db.prepare('SELECT title FROM scenarios WHERE id = ?').get(room.scenario_id);
+  res.json({ ...r.state, scenarioTitle: sc ? sc.title : null });
+});
+
+// 主持人查看成员名单（未结算时含各人当前选票，仅主持凭证可用）
+app.get('/api/rooms/:code/members', (req, res) => {
+  const room = roomCore.getRoom(db, req.params.code);
+  if (!room) return res.status(404).json({ error: '房间不存在', errorCode: 'ROOM_NOT_FOUND' });
+  const auth = roomCore.authorizeHost(db, room, hostTokenOf(req, null));
+  if (!auth.ok) return res.status(auth.status).json({ error: auth.error, errorCode: auth.errorCode });
+  const r = roomCore.buildRoomState(db, room, auth.viewer);
+  res.json({ ok: true, code: room.code, stepNo: room.step_no, status: room.status, members: r.state.members });
+});
+
+// 学员投票 / 改票：{memberToken, optionId, stepNo}；每人每步只计最后一票
+app.post('/api/rooms/:code/vote', (req, res) => {
+  const { optionId, stepNo } = req.body || {};
+  const result = roomCore.castVote(db, {
+    code: req.params.code,
+    memberToken: memberTokenOf(req, req.body),
+    optionId,
+    stepNo,
+  });
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      errorCode: result.errorCode,
+      current: result.current || null,
+      room: result.room && !result.current
+        ? roomCore.buildRoomState(db, result.room, null).state : null,
+    });
+  }
+  const sc = db.prepare('SELECT title FROM scenarios WHERE id = ?').get(result.room.scenario_id);
+  res.json({ ok: true, ...result.state, scenarioTitle: sc ? sc.title : null });
+});
+
+// 主持人结算：{hostToken, stepNo}；票数最多选项推进，同票按冻结版本编排顺序；无人投票拒绝
+app.post('/api/rooms/:code/settle', (req, res) => {
+  const { stepNo } = req.body || {};
+  const result = roomCore.settleRoom(db, {
+    code: req.params.code,
+    hostToken: hostTokenOf(req, req.body),
+    stepNo,
+  });
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      errorCode: result.errorCode,
+      current: result.current || null,
+    });
+  }
+  const sc = db.prepare('SELECT title FROM scenarios WHERE id = ?').get(result.room.scenario_id);
+  res.json({
+    ok: true,
+    ...result.state,
+    scenarioTitle: sc ? sc.title : null,
+    settled: result.settled,
+  });
 });
 
 // ---------- 培训师：处置覆盖报告 ----------

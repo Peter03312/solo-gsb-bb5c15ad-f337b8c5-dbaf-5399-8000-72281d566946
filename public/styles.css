@@ -366,3 +366,63 @@ code { background: #eef2f6; padding: 1px 6px; border-radius: 4px; font-size: 12p
 @media (max-width: 900px) {
   .session-grid, .editor-grid { grid-template-columns: 1fr; }
 }
+
+/* ---------- 共识演练房间 ---------- */
+.room-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 900px) {
+  .room-cols { grid-template-columns: 1fr; }
+}
+.room-created { margin-top: 12px; }
+.room-secret {
+  display: inline-block;
+  background: #f7f9fc;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 3px 8px;
+  margin: 4px 0;
+  word-break: break-all;
+  user-select: all;
+}
+.option-btn.voted {
+  border-color: var(--ok);
+  background: var(--ok-bg);
+  font-weight: 600;
+}
+.tally-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.4fr) 2fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.tally-row.locked { opacity: .55; }
+.tally-row.leading .tally-label { font-weight: 700; color: var(--brand-dark); }
+.tally-row.leading .tally-count b { color: var(--ok); }
+.tally-bar {
+  position: relative;
+  height: 12px;
+  background: #eef1f4;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.tally-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #6aa6dd, var(--brand));
+  border-radius: 999px;
+  transition: width .25s ease;
+}
+.tally-count { white-space: nowrap; font-size: 12px; }
+.member-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--line);
+  font-size: 13px;
+}

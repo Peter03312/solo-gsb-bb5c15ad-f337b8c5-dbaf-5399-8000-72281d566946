@@ -52,8 +52,11 @@ $$('.tab').forEach((tab) => {
     $$('.tab').forEach((t) => t.classList.toggle('active', t === tab));
     const which = tab.dataset.tab;
     $('#view-trainee').hidden = which !== 'trainee';
+    $('#view-rooms').hidden = which !== 'rooms';
     $('#view-trainer').hidden = which !== 'trainer';
+    stopRoomPolling();
     if (which === 'trainee') { loadPublished(); loadSessionList(); }
+    if (which === 'rooms') { initRoomsHome(); }
     if (which === 'trainer') {
       coverageCtx = null;
       $('#trainer-coverage').hidden = true;
@@ -1022,6 +1025,470 @@ function renderCoverageItems(r) {
       </tbody>
     </table>`;
 }
+
+// ====================== 共识演练（房间） ======================
+
+const ROOMS_STORE_KEY = 'consensusRooms.v1'; // [{code, role:'host'|'member', token, name}]
+let roomCtx = null;   // { code, role, token, name, state }
+let roomPollTimer = null;
+
+function loadSavedRooms() {
+  try { return JSON.parse(localStorage.getItem(ROOMS_STORE_KEY) || '[]'); } catch (_) { return []; }
+}
+function saveRoomEntry(code, role, token, name) {
+  const all = loadSavedRooms().filter((r) => !(r.code === code && r.role === role));
+  all.unshift({ code, role, token, name: name || '' });
+  localStorage.setItem(ROOMS_STORE_KEY, JSON.stringify(all.slice(0, 20)));
+}
+
+function roomHeaders() {
+  const h = {};
+  if (roomCtx) {
+    if (roomCtx.role === 'host') h['X-Room-Host-Token'] = roomCtx.token;
+    else h['X-Room-Member-Token'] = roomCtx.token;
+  }
+  return h;
+}
+
+async function roomApi(url, opts = {}) {
+  const res = await fetch(url, {
+    method: opts.method || 'GET',
+    headers: { ...(opts.body ? { 'Content-Type': 'application/json' } : null), ...(opts.headers || {}), ...roomHeaders() },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (_) { /* 非 JSON */ }
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `请求失败 (${res.status})`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+async function initRoomsHome() {
+  stopRoomPolling();
+  roomCtx = null;
+  $('#rooms-home').hidden = false;
+  $('#rooms-console').hidden = true;
+  renderSavedRooms();
+  try {
+    const list = await api('/api/published');
+    const sel = $('#room-scenario');
+    if (!list.length) {
+      sel.innerHTML = '<option value="">（暂无已发布情境）</option>';
+      $('#room-version').innerHTML = '';
+      return;
+    }
+    sel.innerHTML = list.map((s) =>
+      `<option value="${esc(s.id)}">${esc(s.title)}（最新 v${s.current_version}）</option>`).join('');
+    await loadRoomVersionOptions();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+async function loadRoomVersionOptions() {
+  const id = $('#room-scenario').value;
+  const sel = $('#room-version');
+  if (!id) { sel.innerHTML = ''; return; }
+  try {
+    const detail = await api(`/api/scenarios/${encodeURIComponent(id)}`);
+    const versions = (detail.versions || []).slice().sort((a, b) => b.version - a.version);
+    sel.innerHTML = versions.map((v, i) =>
+      `<option value="${v.version}"${i === 0 ? ' selected' : ''}>v${v.version}（冻结于 ${fmtTime(v.created_at)}）</option>`).join('');
+  } catch (err) { toast(err.message, 'err'); }
+}
+$('#room-scenario').addEventListener('change', loadRoomVersionOptions);
+
+// ---------- 培训师：开启房间 ----------
+$('#btn-create-room').addEventListener('click', async () => {
+  const scenarioId = $('#room-scenario').value;
+  if (!scenarioId) return toast('暂无已发布情境，无法开启', 'err');
+  const version = parseInt($('#room-version').value, 10);
+  const hostName = $('#room-host-name').value.trim();
+  try {
+    const r = await api('/api/rooms', { method: 'POST', body: { scenarioId, version, hostName } });
+    saveRoomEntry(r.joinCode, 'host', r.hostToken, hostName || r.room.hostName || '主持人');
+    const box = $('#room-created');
+    box.classList.remove('hidden');
+    box.innerHTML = `
+      <div class="report ok">
+        <div class="r-title">✅ 共识演练已开启（锁定 v${r.room.version}，后续发布不改变本场规则）</div>
+        <div>学员加入码：<code class="room-secret" id="rc-new-code">${esc(r.joinCode)}</code>
+          <button class="btn sm" id="btn-copy-code">复制</button></div>
+        <div>主持凭证（仅本场主持结算使用，切勿发给学员）：</div>
+        <code class="room-secret" id="rc-new-token">${esc(r.hostToken)}</code>
+        <div style="margin-top:8px"><button class="btn primary" id="btn-enter-new-room">进入主持台 →</button></div>
+      </div>`;
+    toast('房间已开启，请保存主持凭证', 'ok');
+    renderSavedRooms();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+$('#room-created').addEventListener('click', async (e) => {
+  if (e.target.id === 'btn-copy-code') {
+    const code = $('#rc-new-code').textContent;
+    try { await navigator.clipboard.writeText(code); toast('加入码已复制', 'ok'); }
+    catch (_) { toast(`请手动复制：${code}`); }
+  }
+  if (e.target.id === 'btn-enter-new-room') {
+    const code = $('#rc-new-code').textContent.trim();
+    const token = $('#rc-new-token').textContent.trim();
+    await enterRoom(code, 'host', token);
+  }
+});
+
+// ---------- 学员：加入房间 ----------
+$('#btn-room-join').addEventListener('click', async () => {
+  const code = $('#room-join-code').value.trim();
+  const name = $('#room-join-name').value.trim();
+  if (!code) return toast('请输入加入码');
+  if (!name) return toast('请填写姓名');
+  try {
+    const r = await roomApi(`/api/rooms/${encodeURIComponent(code)}/join`,
+      { method: 'POST', body: { name } });
+    saveRoomEntry(r.joinCode, 'member', r.memberToken, r.memberName);
+    toast('已加入房间，成员凭证已保存在本机', 'ok');
+    renderSavedRooms();
+    await enterRoom(r.joinCode, 'member', r.memberToken);
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+// ---------- 恢复入口 ----------
+$('#btn-room-resume').addEventListener('click', async () => {
+  const code = $('#room-resume-code').value.trim();
+  const token = $('#room-resume-token').value.trim();
+  if (!code) return toast('请输入房间码');
+  if (!token) return toast('请输入主持凭证或成员凭证');
+  // 角色由 /state 自动探测（主持凭证通过主持鉴权，否则按成员凭证进入）
+  await enterRoom(code, null, token);
+});
+
+function renderSavedRooms() {
+  const box = $('#room-saved');
+  const saved = loadSavedRooms();
+  if (!saved.length) { box.innerHTML = '<div class="muted">本机暂无保存的房间凭证。</div>'; return; }
+  box.innerHTML = `
+    <table class="ses-table">
+      <thead><tr><th>房间码</th><th>角色</th><th>姓名</th><th>状态</th><th></th></tr></thead>
+      <tbody>
+        ${saved.map((r) => `
+          <tr>
+            <td><code>${esc(r.code)}</code></td>
+            <td>${r.role === 'host' ? '🎛️ 主持人' : '🙋 学员'}</td>
+            <td>${esc(r.name || '—')}</td>
+            <td data-room-status="${esc(r.code)}"><span class="muted">—</span></td>
+            <td>
+              <button class="btn sm" data-room-enter="${esc(r.code)}" data-room-role="${r.role}">进入</button>
+              <button class="btn sm" data-room-forget="${esc(r.code)}" data-room-role="${r.role}">忘记</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+  // 后台探测房间公开状态
+  saved.forEach((r) => {
+    api(`/api/rooms/${encodeURIComponent(r.code)}`).then((st) => {
+      const cell = document.querySelector(`[data-room-status="${CSS.escape(r.code)}"]`);
+      if (cell) cell.innerHTML = st.ended
+        ? '<span class="status-ended">已结束</span>'
+        : `<span class="status-active">进行中·第${st.stepNo}步·${st.memberCount}人</span>`;
+    }).catch(() => {});
+  });
+}
+
+$('#room-saved').addEventListener('click', async (e) => {
+  const forget = e.target.closest('[data-room-forget]');
+  if (forget) {
+    const { roomForget: code, roomRole: role } = forget.dataset;
+    localStorage.setItem(ROOMS_STORE_KEY, JSON.stringify(
+      loadSavedRooms().filter((r) => !(r.code === code && r.role === role))));
+    renderSavedRooms();
+    return;
+  }
+  const enter = e.target.closest('[data-room-enter]');
+  if (enter) {
+    const found = loadSavedRooms().find((r) =>
+      r.code === enter.dataset.roomEnter && r.role === enter.dataset.roomRole);
+    if (found) await enterRoom(found.code, found.role, found.token);
+  }
+});
+
+// ---------- 进入房间（主持台 / 学员台） ----------
+
+async function enterRoom(code, roleHint, token) {
+  // roleHint 缺省时自动探测：先用主持凭证试 /state，401 再按学员进入
+  let role = roleHint;
+  if (role !== 'host' && role !== 'member') {
+    const probe = await fetch(`/api/rooms/${encodeURIComponent(code)}/state`, {
+      headers: { 'X-Room-Host-Token': token },
+    }).then((r) => r.ok).catch(() => false);
+    role = probe ? 'host' : 'member';
+  }
+  roomCtx = { code, role, token, name: '', state: null };
+  $('#rooms-home').hidden = true;
+  $('#rooms-console').hidden = false;
+  try {
+    const state = await fetchRoomState();
+    roomCtx.state = state;
+    roomCtx.name = state.viewer ? (state.viewer.name || state.viewer.hostName || '') : '';
+    renderRoomConsole(state);
+    startRoomPolling();
+  } catch (err) {
+    toast(err.message, 'err');
+    $('#rooms-home').hidden = false;
+    $('#rooms-console').hidden = true;
+    roomCtx = null;
+  }
+}
+
+async function fetchRoomState() {
+  return roomApi(`/api/rooms/${encodeURIComponent(roomCtx.code)}/state`);
+}
+
+$('#btn-room-exit').addEventListener('click', () => {
+  stopRoomPolling();
+  roomCtx = null;
+  $('#rooms-console').hidden = true;
+  $('#rooms-home').hidden = false;
+  initRoomsHome();
+});
+$('#btn-room-refresh').addEventListener('click', async () => {
+  try {
+    roomCtx.state = await fetchRoomState();
+    renderRoomConsole(roomCtx.state);
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+// 轮询：主持 3 秒、学员 4 秒，页面离开 / 切页即停
+function startRoomPolling() {
+  stopRoomPolling();
+  const interval = roomCtx && roomCtx.role === 'host' ? 3000 : 4000;
+  roomPollTimer = setInterval(async () => {
+    if (!roomCtx) return stopRoomPolling();
+    try {
+      roomCtx.state = await fetchRoomState();
+      renderRoomConsole(roomCtx.state);
+    } catch (_) { /* 短暂网络错误静默 */ }
+  }, interval);
+}
+function stopRoomPolling() {
+  if (roomPollTimer) { clearInterval(roomPollTimer); roomPollTimer = null; }
+}
+
+// ---------- 渲染主持台 / 学员台 ----------
+
+function roomHideBanner() {
+  const b = $('#rc-banner');
+  b.className = 'banner hidden';
+  b.textContent = '';
+}
+function roomShowBanner(html, kind) {
+  const b = $('#rc-banner');
+  b.innerHTML = html;
+  b.className = 'banner ' + kind;
+}
+
+function renderRoomConsole(s) {
+  roomCtx.state = s;
+  const isHost = s.viewer && s.viewer.role === 'host';
+  $('#rc-scenario-title').textContent = s.scenarioTitle || '';
+  $('#rc-code').textContent = s.code;
+  $('#rc-version').textContent = 'v' + s.version;
+  $('#rc-step').textContent = s.stepNo;
+  $('#rc-score').textContent = s.totalScore;
+  $('#rc-score').className = scoreClass(s.totalScore);
+  $('#rc-members').textContent = s.memberCount;
+  $('#rc-role').textContent = isHost
+    ? `🎛️ 主持${s.viewer.hostName ? '·' + s.viewer.hostName : ''}`
+    : `🙋 学员·${s.viewer ? (s.viewer.name || '') : ''}`;
+
+  const node = s.currentNode;
+  $('#rc-node-kick').textContent = node && node.isEnd ? '结局' : '当前情境';
+  $('#rc-node-title').textContent = node ? node.title : '（节点缺失）';
+  $('#rc-node-narrative').textContent = node && node.narrative ? node.narrative : '';
+
+  $('#rc-state-list').innerHTML = (s.states || []).map((st) => `
+    <div class="state-row">
+      <span>${esc(st.name)}</span>
+      <span class="state-val ${st.value ? 'yes' : 'no'}">${st.value ? '● 是' : '○ 否'}</span>
+    </div>`).join('');
+
+  roomHideBanner();
+  if (s.ended) {
+    roomShowBanner(`本场共识演练已结束：全员沿同一条路径到达结局「${node ? esc(node.title) : ''}」，共 ${s.stepNo} 步，累计 <b>${s.totalScore}</b> 分。`, 'ok');
+  }
+
+  renderVoteCard(s, isHost);
+  renderHostCard(s, isHost);
+  renderTallyCard(s, isHost);
+  renderMembersCard(s, isHost);
+  renderRoomPath(s);
+}
+
+function renderVoteCard(s, isHost) {
+  const card = $('#rc-vote-card');
+  const hint = $('#rc-vote-hint');
+  const box = $('#rc-option-list');
+  if (isHost) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  if (s.ended) {
+    hint.textContent = '演练已结束。';
+    box.innerHTML = '<div class="muted">本场已结束，感谢参与。</div>';
+    return;
+  }
+  hint.textContent = `当前第 ${s.stepNo} 步：选择一个处置投票；结算前可改票，你在本步只有最后一票有效。结算完成前看不到他人的选票。`;
+  const myVote = s.myCurrentVote || null;
+  const avail = (s.availableOptions || []).map((o) => `
+    <button class="option-btn ${myVote === o.id ? 'voted' : ''}" data-room-opt="${esc(o.id)}">
+      ${myVote === o.id ? '✅ ' : ''}${esc(o.label)}
+      ${o.conditions.length ? `<span class="conds">条件：${o.conditions.map((c) => condText(s, c)).join('；')}</span>` : ''}
+    </button>`).join('');
+  const unavail = (s.unavailableOptions || []).map((o) => `
+    <button class="option-btn disabled-opt" disabled title="当前条件不满足">
+      🔒 ${esc(o.label)}
+      <span class="lock">${o.failingConditions.map((f) => `${esc(f.stateName)} 需为「${f.required ? '是' : '否'}」`).join('；')}</span>
+    </button>`).join('');
+  box.innerHTML = (avail || '<div class="muted">当前没有可投票选项。</div>') + unavail;
+}
+
+function renderHostCard(s, isHost) {
+  const card = $('#rc-host-card');
+  if (!isHost) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  if (s.ended) {
+    $('#btn-room-settle').disabled = true;
+    $('#rc-settle-step').textContent = s.stepNo;
+  } else {
+    $('#btn-room-settle').disabled = false;
+    $('#rc-settle-step').textContent = s.stepNo;
+  }
+}
+
+function tallyRowsHtml(tally) {
+  const max = Math.max(0, ...tally.map((t) => t.count));
+  return tally.map((t) => `
+    <div class="tally-row ${t.count === max && max > 0 ? 'leading' : ''} ${t.available === false ? 'locked' : ''}">
+      <span class="tally-label">${t.available === false ? '🔒 ' : ''}${esc(t.label)}</span>
+      <span class="tally-bar"><span class="tally-fill" style="width:${max ? Math.round(t.count / max * 100) : 0}%"></span></span>
+      <span class="tally-count"><b>${t.count}</b> 票${t.voters && t.voters.length ? ` <span class="muted">（${t.voters.map(esc).join('、')}）</span>` : ''}</span>
+    </div>`).join('');
+}
+
+function renderTallyCard(s, isHost) {
+  const title = $('#rc-tally-title');
+  const box = $('#rc-tally-box');
+  if (isHost && !s.ended && s.currentTally) {
+    title.textContent = `第 ${s.stepNo} 步实时票数（仅主持可见）`;
+    const t = s.currentTally;
+    box.innerHTML = `<div class="muted" style="margin-bottom:6px">已投票 ${t.totalVotes} / ${s.memberCount} 人</div>`
+      + tallyRowsHtml(t.options);
+    return;
+  }
+  // 学员（及已结束后的主持）：展示最近一次“已结算”步骤的票数
+  if (s.lastSettlement) {
+    const ls = s.lastSettlement;
+    title.textContent = `第 ${ls.step} 步已结算票数`;
+    box.innerHTML = `<div class="muted" style="margin-bottom:6px">参与投票 ${ls.votes} 人；推进选项 <b>${esc((ls.tally.find((x) => x.optionId === ls.winningOptionId) || {}).label || ls.winningOptionId)}</b></div>`
+      + tallyRowsHtml(ls.tally);
+    return;
+  }
+  title.textContent = '本步票数';
+  box.innerHTML = '<div class="muted">本步尚未结算；结算前不显示他人选票。</div>';
+}
+
+function renderMembersCard(s, isHost) {
+  const card = $('#rc-members-card');
+  const box = $('#rc-members-box');
+  if (!isHost) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  if (!s.members || !s.members.length) {
+    box.innerHTML = '<div class="muted">还没有学员加入。把加入码发给学员即可。</div>';
+    return;
+  }
+  box.innerHTML = s.members.map((m) => `
+    <div class="member-row">
+      <span>${esc(m.name)}</span>
+      <span class="${m.voted ? 'status-active' : 'muted'}">
+        ${s.ended ? '—' : (m.voted ? `已投：${esc(optionLabel(s, m.currentOptionId))}` : '未投票')}
+      </span>
+    </div>`).join('');
+}
+
+function optionLabel(s, optionId) {
+  const o = (s.availableOptions || []).find((x) => x.id === optionId)
+    || (s.unavailableOptions || []).find((x) => x.id === optionId);
+  return o ? o.label : optionId;
+}
+
+function renderRoomPath(s) {
+  $('#rc-path-list').innerHTML = (s.path || []).map((p) => {
+    const tallyTxt = Array.isArray(p.tally) && p.tally.length
+      ? `<span class="pl-sub">票数：${p.tally.filter((t) => t.count > 0)
+          .map((t) => `${t.label}×${t.count}`).join('，')}（共 ${p.votes || 0} 人）</span>` : '';
+    const note = p.scoreNote ? `<span class="pl-note">评分说明：${esc(p.scoreNote)}</span>` : '';
+    return `
+    <li>
+      <b>第 ${p.step} 步</b>：${esc(p.fromNodeTitle)}
+      —「${esc(p.optionLabel)}」→ ${esc(p.toNodeTitle)}
+      ${scoreBadge(p.score)}
+      ${tallyTxt}
+      ${note}
+    </li>`;
+  }).join('') || '<li class="muted">尚未结算任何步骤。</li>';
+}
+
+// ---------- 投票 / 结算 交互 ----------
+
+$('#rc-option-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-room-opt]');
+  if (!btn || !roomCtx || roomCtx.role !== 'member') return;
+  const s = roomCtx.state;
+  if (!s || s.ended) return;
+  const optionId = btn.dataset.roomOpt;
+  try {
+    const state = await roomApi(`/api/rooms/${encodeURIComponent(roomCtx.code)}/vote`, {
+      method: 'POST',
+      body: { optionId, stepNo: s.stepNo },
+    });
+    roomCtx.state = state;
+    renderRoomConsole(state);
+    roomShowBanner(`已记录你在第 ${s.stepNo} 步的投票：「${esc(optionLabel(s, optionId))}」。结算前可改票。`, 'info');
+  } catch (err) {
+    if (err.data && err.data.current) {
+      roomCtx.state = err.data.current;
+      renderRoomConsole(err.data.current);
+    }
+    roomShowBanner(`投票未被接受：${esc(err.message)}`, 'error');
+  }
+});
+
+$('#btn-room-settle').addEventListener('click', async () => {
+  if (!roomCtx || roomCtx.role !== 'host') return;
+  const s = roomCtx.state;
+  if (!s || s.ended) return;
+  try {
+    const r = await roomApi(`/api/rooms/${encodeURIComponent(roomCtx.code)}/settle`, {
+      method: 'POST',
+      body: { stepNo: s.stepNo },
+    });
+    roomCtx.state = r;
+    renderRoomConsole(r);
+    const st = r.settled;
+    roomShowBanner(
+      `第 ${st.step} 步已结算（${st.votes} 票）：推进「${esc(st.winningOptionLabel)}」→ ${esc(st.advancedToNodeTitle)}`
+      + (st.score !== 0 ? `；本步得分 ${st.score > 0 ? '+' : ''}${st.score}，累计 ${st.totalScore} 分` : '')
+      + (st.ended ? '；已到达结局，本场结束。' : ''),
+      'ok');
+  } catch (err) {
+    if (err.data && err.data.current) {
+      roomCtx.state = err.data.current;
+      renderRoomConsole(err.data.current);
+    }
+    roomShowBanner(`结算被拒绝：${esc(err.message)}（当前仍为第 ${err.data && err.data.current ? err.data.current.stepNo : s.stepNo} 步）`, 'error');
+  }
+});
 
 // ====================== 初始化 ======================
 

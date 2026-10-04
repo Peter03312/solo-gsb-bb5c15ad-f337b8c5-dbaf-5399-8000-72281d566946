@@ -13,6 +13,7 @@
 - 每步选择必须携带**当前步号**；步号过期/重复、条件不满足、选项不存在等情况一律返回**原因和现状**，且不推进会话
 - **培训师复盘分叉**：可凭「源会话码 + 分歧步号 + 所见源当前步号」，从任意历史局面创建**可继续选择的分支**；分支沿用源会话绑定的冻结版本，保留分歧步之前的路径与该步现场状态，原会话与其它分支不变；已结束会话也可从其此前的非结局步分叉（结局步不得分叉），分支还可再次分叉
 - **选项评分**：培训师可为每个处置选项填写 **-10 至 10 的整数分值**与**评分说明**（留空按 0 分）；规则随版本冻结。学员每次有效选择后立即看到**本步得分、说明与累计分**；过期/重复/条件不符的选择不计分；分叉继承分歧前得分；历史会话按其绑定版本计算，旧版本无评分字段时各步按 0 分处理
+- **共识演练房间**：培训师可基于任一**已发布冻结版本**开启一场共识演练，取得**主持凭证**与**学员加入码**；学员凭加入码取得各自**成员凭证**，在当前步的可选处置中**投票**（结算前可改票，每人每步只计最后一票），主持人携**所见步号**结算——**票数最多的选项**推进**同一条会话路径**，**同票按冻结版本的选项编排顺序**决定，**无人投票不得结算**。投票、结算、推进均带步号乐观锁并在单事务内完成，防并发重复；过期步号、无效凭证、条件不符或已结束时返回原因与**当前步号**，不改变票数、路径与得分。房间会话**不能经单人选择/复盘分叉入口绕过投票**；未结算时学员看不到他人选票
 - **处置覆盖报告**：培训师可针对任一**已发布冻结版本**查看覆盖情况——以该版本从初态可达的「**节点 × 进入时现场状态 × 可选选项**」组合为覆盖项，给出**总数 / 已覆盖 / 未覆盖**与逐项明细，可一键**只看未覆盖项**，方便找到学员还没练到的处置
 - 草稿中的**无效引用**（不存在的状态/目标节点）与**矛盾条件**（同一状态同时要求是和否）在保存时即被拒绝；**非整数或越界分值**同样在保存时拒绝
 
@@ -86,7 +87,7 @@ npm start
 | `APP_PORT`（仅 Compose） | `8080` | 宿主机映射端口，改它即可，无需改 Dockerfile |
 | `TZ` | `Asia/Shanghai` | 容器时区（影响时间显示） |
 
-数据库表：`scenarios`（情境及草稿）、`versions`（每次发布冻结的完整内容）、`sessions`（学员会话：步号、状态位掩码、已走路径、绑定版本，以及复盘分叉溯源列 `parent_code` / `fork_step_no` / `root_code`）。
+数据库表：`scenarios`（情境及草稿）、`versions`（每次发布冻结的完整内容）、`sessions`（单人学员会话：步号、状态位掩码、已走路径、绑定版本，以及复盘分叉溯源列 `parent_code` / `fork_step_no` / `root_code`）、`rooms`（共识演练房间：绑定版本、主持凭证、步号、共享路径与每步票数快照）、`room_members`（房间学员与各自成员凭证）、`room_votes`（每人每步一行的当前选票，改票即覆盖）。房间与单人会话分表存储、码空间统一，互不混入。
 
 ---
 
@@ -163,6 +164,44 @@ npm start
 | 源绑定的冻结版本内容缺失 | `500 VERSION_MISSING`（同样返回源当前步号） |
 | 缺少/非法的 `forkStepNo`、`observedStepNo` | `400` |
 
+### 共识演练（房间投票 — 培训师主持 + 多名学员）
+
+页面顶部第 2 个页签「**共识演练**」。培训师选定**已发布情境的某个冻结版本**（默认最新版）开启一场房间：**规则自开启时锁定在该版本**，之后情境再发布新版本也不改变本场规则；新房间才用新版本。
+
+**角色与凭证**
+
+| 角色 | 取得方式 | 凭证 |
+| --- | --- | --- |
+| 主持人（培训师） | `POST /api/rooms` 开启房间，或页面左侧「开启共识演练」 | **主持凭证** `hostToken`（48 位）+ **学员加入码**（即房间码，10 位） |
+| 学员 | 凭加入码 + 房间内唯一姓名 `POST /api/rooms/:code/join`，或页面右侧加入 | 各自独立的**成员凭证** `memberToken`（48 位） |
+
+> 主持/成员凭证只在开启/加入时**完整返回一次**；页面会把本机用过的凭证存在浏览器 `localStorage` 方便回到房间，API 调用方请自行妥善保存。凭证可经请求头（`X-Room-Host-Token` / `X-Room-Member-Token`）或请求体/查询参数（`hostToken` / `memberToken`）传递。
+
+**流程与规则**
+
+1. 学员在当前步的**可选处置**（条件满足的选项）里投票；条件不满足的选项与单人演练一样灰显且服务端拒绝；
+2. **结算前可反复改票**：每人每步在 `room_votes` 中只有一行，改票即覆盖，**只计最后一票**；
+3. 主持人点「按第 N 步结算」（或调 `POST /api/rooms/:code/settle`，必须携带**所见当前步号** `stepNo`）：
+   - **票数最多的选项**获胜并推进**同一条会话路径**（全员共享同一个当前局面、状态与步号）；
+   - **同票时按冻结版本里该节点选项的编排顺序**（`options` 数组顺序）决定，排在前面的获胜；
+   - **无人投票不得结算**（`409 NO_VOTES`），不推进；
+4. 每次结算记录当步**全员票数快照**（`path[].tally` / `votes`）并按冻结版本计分；学员随后能看到**上一步**各选项票数、推进选项与累计分；
+5. **隐私**：一步**未结算前，学员只能看到自己的票**，看不到他人选票、票数分布；主持台可实时看到每人投了什么与当前票数；
+6. 到达结局节点后房间 `ended`，不能再投票、结算或加入。
+
+**防并发与失败约定**：投票（Upsert）、结算（统计票数 + 推进）都在**单个数据库事务**内完成，结算再带 `step_no` 乐观锁——并发重复结算时恰好 1 次成功，其余返回 `409 STEP_STALE`。任何失败（过期步号、无效/跨房间凭证、选项不存在、条件不符、房间已结束、无人投票）都返回**原因、错误码与当前步号**，且**不改变票数、路径和得分**。
+
+**房间会话与单人会话严格隔离**：房间码与单人会话码共用 10 位码空间但分别存于 `rooms` / `sessions` 表；拿房间码调单人入口会被明确拒绝：
+
+| 情况 | HTTP / errorCode |
+| --- | --- |
+| 房间码调 `POST /api/sessions/:code/move`（单人选择） | `409 CONSENSUS_ROOM_NOT_SOLO`（附房间公开摘要与当前步号） |
+| 房间码调 `POST /api/sessions/:code/fork`（复盘分叉） | `409 CONSENSUS_ROOM_NOT_SOLO` |
+| 房间码调 `GET /api/sessions/:code`（单人查询） | `404 CONSENSUS_ROOM_NOT_SOLO`（提示改用 `/api/rooms/:code/state`） |
+| 房间不出现在 `GET /api/sessions` 列表，也不计入处置覆盖报告（覆盖报告只统计 `sessions` 家族） | — |
+
+页面在「共识演练」页签内：学员台展示情境、现场状态、投票按钮（已投票的选项高亮 ✅）、**已结算路径**（每步带票数与得分）；主持台额外展示**实时票数与投票人名单**、成员投票状态与结算按钮；页面每 3–4 秒自动刷新一次。
+
 ---
 
 ## 五、发布检查规则（核心）
@@ -208,6 +247,14 @@ npm start
 | POST | `/api/scenarios/:id/analyze` | 发布前检查（可带未保存草稿） |
 | POST | `/api/scenarios/:id/publish` | 发布冻结新版本（检查不过返回 422 与可复现路径） |
 | GET | `/api/scenarios/:id/versions/:version/coverage` | **处置覆盖报告**（可加 `?uncovered=1` 只列未覆盖项；计数始终基于全量） |
+| POST | `/api/rooms` | **开启共识演练房间**：`{scenarioId, version?, hostName?}`，锁定已发布冻结版本，返回加入码与主持凭证（201） |
+| GET | `/api/rooms` | 持主持凭证列出本人主持的房间（头/参数 `hostToken`；无凭证 400） |
+| GET | `/api/rooms/:code` | 房间公开摘要（无需凭证：状态、当前步号、人数；不含选项/票数/路径） |
+| POST | `/api/rooms/:code/join` | 学员凭加入码加入：`{name}`，返回各自成员凭证（201）；重名 409 |
+| GET | `/api/rooms/:code/state` | 主持台/学员台完整状态（凭 `X-Room-Host-Token` / `X-Room-Member-Token` 区分视角；不带凭证返回公开摘要） |
+| GET | `/api/rooms/:code/members` | 主持人查看成员名单与各人当前选票（仅主持凭证） |
+| POST | `/api/rooms/:code/vote` | 学员投票/改票：`{optionId, stepNo}` + 成员凭证；每人每步只计最后一票 |
+| POST | `/api/rooms/:code/settle` | 主持人携所见步号结算：`{stepNo}` + 主持凭证；票多者推进、同票按编排顺序、无人投票 409 |
 
 ### 评分相关字段（随版本冻结，旧版本/旧会话自动按 0 分兜底）
 
@@ -396,6 +443,136 @@ node -e 'fetch("http://localhost:8080/api/scenarios/sc_14f5505a2f47a3a3/versions
 
 ---
 
+## 六之三、共识演练房间接口（含调用示例）
+
+凭证传递方式（三选一）：请求头 `X-Room-Host-Token` / `X-Room-Member-Token`（推荐）；或请求体字段 `hostToken` / `memberToken`；或查询参数 `?hostToken=` / `?memberToken=`。
+
+### 1) 培训师开启房间（取得主持凭证与学员加入码）
+
+```bash
+curl -s -X POST localhost:8080/api/rooms \
+  -H 'Content-Type: application/json' \
+  -d '{"scenarioId":"sc_14f5505a2f47a3a3","version":1,"hostName":"王教官"}'
+# 201 ->
+# { "ok": true,
+#   "joinCode": "9dcaff3c20",                 # = 学员加入码（房间码，10 位）
+#   "hostToken": "3f9a…（48 位 hex，只完整返回一次）",
+#   "room": { "code":"9dcaff3c20", "version":1, "status":"active", "stepNo":0, ... } }
+```
+
+- `version` 可省略：默认该情境**最新发布版**；显式给定则锁定指定冻结版本，后续发布不影响本场。
+- 情境不存在 `404 SCENARIO_NOT_FOUND`；版本未发布 `404 VERSION_NOT_FOUND`；情境从未发布 `400 NOT_PUBLISHED`。
+
+### 2) 学员凭加入码加入（取得各自成员凭证）
+
+```bash
+curl -s -X POST localhost:8080/api/rooms/9dcaff3c20/join \
+  -H 'Content-Type: application/json' -d '{"name":"李四"}'
+# 201 -> { "ok": true, "joinCode":"9dcaff3c20",
+#          "memberToken":"7b12…（48 位 hex）", "memberName":"李四",
+#          "room": { ...完整学员视角房间状态... } }
+```
+
+重名 `409 MEMBER_NAME_EXISTS`、未带姓名 `400 MEMBER_NAME_REQUIRED`、房间不存在 `404 ROOM_NOT_FOUND`、房间已结束 `409 ROOM_ENDED`（错误响应附公开摘要与当前步号）。
+
+### 3) 学员投票 / 改票（每人每步只计最后一票）
+
+```bash
+# 投票（必须携带所见当前步号）
+curl -s -X POST localhost:8080/api/rooms/9dcaff3c20/vote \
+  -H 'Content-Type: application/json' \
+  -H 'X-Room-Member-Token: 7b12…' \
+  -d '{"optionId":"o_cut_power","stepNo":0}'
+# 200 -> 学员视角房间状态（myCurrentVote:"o_cut_power"；不含他人选票）
+
+# 结算前改票：同一步再投别的选项即覆盖，旧票不再计数
+curl -s -X POST localhost:8080/api/rooms/9dcaff3c20/vote \
+  -H 'Content-Type: application/json' \
+  -H 'X-Room-Member-Token: 7b12…' \
+  -d '{"optionId":"o_evac","stepNo":0}'
+```
+
+失败码：`401 MEMBER_TOKEN_REQUIRED/INVALID`（缺失/无效/他房凭证）、`409 STEP_STALE`（步号过期，附当前步号）、`400 OPTION_NOT_FOUND`、`409 CONDITION_NOT_MET`、`409 ROOM_ENDED`；**失败一律不改变票数**。
+
+### 4) 主持人结算（票多者推进；同票按冻结版本编排顺序；无人投票拒绝）
+
+```bash
+curl -s -X POST localhost:8080/api/rooms/9dcaff3c20/settle \
+  -H 'Content-Type: application/json' \
+  -H 'X-Room-Host-Token: 3f9a…' \
+  -d '{"stepNo":0}'
+# 200 ->
+# { "ok": true, "stepNo": 1, "totalScore": 3, ...房间状态,
+#   "settled": {
+#     "step": 1,
+#     "winningOptionId": "o_cut_power",
+#     "winningOptionLabel": "立即切断厂区总电源，再安排侦查",
+#     "votes": 3,                          # 本步有效票数
+#     "tally": [ {"optionId":"o_cut_power","label":"…","count":2},
+#                {"optionId":"o_rush_in","label":"…","count":1} ],   # 按冻结版本选项顺序
+#     "score": 3, "totalScore": 3,
+#     "advancedToNodeId": "n_scene", "advancedToNodeTitle": "查明泄漏点",
+#     "ended": false } }
+```
+
+- 同票示例：`o_cut_power` 1 票、`o_rush_in` 1 票时，因 `o_cut_power` 在冻结版本中编排更靠前而胜出；
+- `409 NO_VOTES`：本步无任何选票，**不得结算**，步号/路径/得分不变；
+- `409 STEP_STALE`：携带步号与房间当前步号不一致（页面过期或并发重复结算），只有携带正确步号的那次会成功；
+- `401 HOST_TOKEN_REQUIRED/INVALID`、`409 ROOM_ENDED` 同理拒绝且不改变数据。
+
+### 5) 状态查询（不同凭证返回不同视角）
+
+```bash
+# 公开摘要（不带凭证；不含选项、票数、路径、得分）
+curl -s localhost:8080/api/rooms/9dcaff3c20
+# -> {"kind":"consensus-room","code":"…","version":1,"status":"active",
+#     "ended":false,"stepNo":0,"memberCount":3}
+
+# 主持台：含 currentTally（未结算实时票数+投票人）、members（谁投了什么）、完整路径
+curl -s localhost:8080/api/rooms/9dcaff3c20/state -H 'X-Room-Host-Token: 3f9a…'
+
+# 学员台：只含 myCurrentVote（自己的票）；currentTally 为 null；
+#         lastSettlement 给出上一已结算步的票数（人人可见）
+curl -s localhost:8080/api/rooms/9dcaff3c20/state -H 'X-Room-Member-Token: 7b12…'
+
+# 主持成员名单
+curl -s localhost:8080/api/rooms/9dcaff3c20/members -H 'X-Room-Host-Token: 3f9a…'
+
+# 列出本主持的房间
+curl -s localhost:8080/api/rooms -H 'X-Room-Host-Token: 3f9a…'
+```
+
+房间状态的关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `stepNo` / `status` / `ended` | 当前步号（0 起）、`active`/`ended`、是否已结束 |
+| `currentNode` / `states` / `availableOptions` / `unavailableOptions` | 与单人会话快照同构的当前局面（**选项不含分值/说明**） |
+| `path[]` | 已结算路径；每项含 `step/fromNodeTitle/optionLabel/toNodeTitle/score/scoreNote` 与当步 `votes`、`tally[]` |
+| `totalScore` | 全员共同路径的累计分（按房间绑定的冻结版本计算） |
+| `lastSettlement` | 最近一次结算的票数快照（所有在场学员可见；未结算过为缺省） |
+| `myCurrentVote` | 仅学员视角：自己在当前步的票（未投为 `null`） |
+| `currentTally` | 仅主持视角且未结束：当前步实时票数 `{totalVotes, options:[{optionId,label,available,count,voters[]}]}`；学员视角恒为 `null` |
+| `members[]` | 仅主持视角：`{id,name,voted,currentOptionId}` |
+| `viewer` | 当前视角：`{role:"host",hostName}` 或 `{role:"member",memberId,name}` |
+
+### 6) 与单人入口的边界（防绕过）
+
+```bash
+# 拿房间码走单人选择 / 复盘分叉会被拒绝，无法绕过投票
+curl -s -X POST localhost:8080/api/sessions/9dcaff3c20/move \
+  -H 'Content-Type: application/json' -d '{"optionId":"o_cut_power","stepNo":0}'
+# 409 { "errorCode":"CONSENSUS_ROOM_NOT_SOLO",
+#       "error":"该码属于共识演练房间（非单人会话）：房间的每一步必须由学员投票、主持人结算…",
+#       "current": { "kind":"consensus-room", "stepNo":0, ... } }
+
+curl -s -X POST localhost:8080/api/sessions/9dcaff3c20/fork \
+  -H 'Content-Type: application/json' -d '{"forkStepNo":0,"observedStepNo":1}'
+# 409 CONSENSUS_ROOM_NOT_SOLO
+```
+
+---
+
 ## 七、目录结构
 
 ```
@@ -404,16 +581,17 @@ node -e 'fetch("http://localhost:8080/api/scenarios/sc_14f5505a2f47a3a3/versions
 ├── docker-compose.yml
 ├── package.json / package-lock.json
 ├── server/
-│   ├── server.js      # Express 路由（编排 / 发布 / 会话 / 复盘分叉 / 处置覆盖报告接口）
-│   ├── db.js          # SQLite 连接、建表（含老库加列迁移）、id 生成
+│   ├── server.js      # Express 路由（编排 / 发布 / 单人会话 / 复盘分叉 / 覆盖报告 / 共识演练房间接口）
+│   ├── db.js          # SQLite 连接、建表（含老库加列迁移）、id/凭证生成
 │   ├── scenario.js    # 草稿校验 + 状态空间可达性/死路/循环分析
 │   ├── session.js     # 会话快照、“带步号的一步”推进、forkSession 分叉、loadLineage 对照树
+│   ├── room.js        # 共识演练房间：开启/加入/投票改票/结算/视角化状态（事务 + 步号乐观锁）
 │   ├── coverage.js    # 处置覆盖报告：覆盖项枚举 + 按家族去重的已完成路径回放（损坏整体报错）
 │   └── seed.js        # 内置示例情境（首启写入）
 ├── public/
-│   ├── index.html     # 单页界面（学员演练 / 培训师编排两个页签，编排内含处置覆盖报告视图）
+│   ├── index.html     # 单页界面（学员演练 / 共识演练 / 培训师编排三个页签）
 │   ├── styles.css
-│   └── app.js         # 含复盘分叉面板、来源/分支对照树与处置覆盖报告视图
+│   └── app.js         # 含主持台/学员台、复盘分叉面板、对照树与覆盖报告视图
 └── data/              # 运行后生成：SQLite 数据库（持久化卷）
 ```
 

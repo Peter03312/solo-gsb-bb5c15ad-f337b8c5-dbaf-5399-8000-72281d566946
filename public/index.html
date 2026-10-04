@@ -11,6 +11,7 @@
     <div class="brand">🚒 事故处置情境编排台</div>
     <nav class="tabs">
       <button class="tab active" data-tab="trainee">学员演练</button>
+      <button class="tab" data-tab="rooms">共识演练</button>
       <button class="tab" data-tab="trainer">培训师编排</button>
     </nav>
   </header>
@@ -88,6 +89,126 @@
             <div class="card">
               <h4>来源与分支对照</h4>
               <div id="lineage-box"><div class="muted">加载中…</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 共识演练视图 ============ -->
+    <section id="view-rooms" hidden>
+      <div id="rooms-home">
+        <div class="room-cols">
+          <!-- 培训师：开启演练 -->
+          <div class="card">
+            <h4>🎛️ 培训师：开启共识演练</h4>
+            <p class="hint">选择一个<b>已发布</b>情境及其<b>冻结版本</b>（默认最新版；本场规则自开启起锁定，之后再发布新版本也不改变本场），开启后取得<b>主持凭证</b>与<b>学员加入码</b>。</p>
+            <div class="field">
+              <label>已发布情境</label>
+              <select id="room-scenario" class="input"></select>
+            </div>
+            <div class="field">
+              <label>冻结版本</label>
+              <select id="room-version" class="input sm"></select>
+            </div>
+            <div class="field">
+              <label>主持人称呼（可选）</label>
+              <input id="room-host-name" class="input" maxlength="100" placeholder="如：王教官" />
+            </div>
+            <button class="btn primary" id="btn-create-room" style="width:100%">开启共识演练</button>
+            <div id="room-created" class="room-created hidden"></div>
+          </div>
+
+          <!-- 学员：凭加入码入场 -->
+          <div class="card">
+            <h4>🙋 学员：加入共识演练</h4>
+            <p class="hint">向主持人索取 <b>10 位加入码</b>，填写你的姓名（同房间内唯一），加入后取得只属于你的<b>成员凭证</b>：每步在可选项里投票，结算前可随时改票，每人每步只计最后一票。</p>
+            <div class="field">
+              <label>加入码</label>
+              <input id="room-join-code" class="input" maxlength="10" placeholder="10 位房间码" />
+            </div>
+            <div class="field">
+              <label>你的姓名</label>
+              <input id="room-join-name" class="input" maxlength="100" placeholder="如：李四" />
+            </div>
+            <button class="btn primary" id="btn-room-join" style="width:100%">加入房间</button>
+          </div>
+        </div>
+
+        <!-- 恢复入口 -->
+        <h2 class="mt">回到已有房间</h2>
+        <div class="muted" style="margin:-6px 0 10px">主持凭证/成员凭证只在开启/加入时完整返回一次，本机已为你记住；换设备或清缓存后需重新获取。</div>
+        <div class="inline-row" style="max-width:560px">
+          <input id="room-resume-code" class="input" maxlength="10" placeholder="房间码（10 位）" />
+          <input id="room-resume-token" class="input" placeholder="主持凭证 或 成员凭证" />
+          <button class="btn" id="btn-room-resume">进入</button>
+        </div>
+        <div id="room-saved" class="mt"></div>
+      </div>
+
+      <div id="rooms-console" hidden>
+        <div class="session-bar">
+          <div>
+            <div class="muted" id="rc-scenario-title"></div>
+            <div class="ses-meta">
+              房间码 <code id="rc-code"></code>
+              · 冻结版本 <b id="rc-version"></b>
+              · 当前第 <b id="rc-step">0</b> 步
+              · 累计分 <b id="rc-score">0</b>
+              · 成员 <b id="rc-members">0</b> 人
+              · <span id="rc-role"></span>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn ghost" id="btn-room-refresh">刷新</button>
+            <button class="btn ghost" id="btn-room-exit">返回</button>
+          </div>
+        </div>
+
+        <div id="rc-banner" class="banner hidden"></div>
+
+        <div class="session-grid">
+          <div class="col-main">
+            <div class="card" id="rc-node-card">
+              <div class="node-kick" id="rc-node-kick"></div>
+              <h3 id="rc-node-title"></h3>
+              <p class="narrative" id="rc-node-narrative"></p>
+            </div>
+
+            <!-- 学员投票区 -->
+            <div class="card" id="rc-vote-card">
+              <h4>你的投票</h4>
+              <div class="muted" id="rc-vote-hint" style="margin-bottom:8px"></div>
+              <div id="rc-option-list"></div>
+            </div>
+
+            <!-- 主持结算区 -->
+            <div class="card hidden" id="rc-host-card">
+              <h4>🎛️ 主持台</h4>
+              <div class="muted" style="margin-bottom:10px">
+                结算严格按你所见的当前步号执行：票数最多的处置推进同一条会话路径；同票时按冻结版本的选项编排顺序（排在前者胜）；<b>无人投票不得结算</b>。
+              </div>
+              <button class="btn primary" id="btn-room-settle" style="width:100%">按第 <span id="rc-settle-step">0</span> 步结算并推进</button>
+            </div>
+          </div>
+
+          <div class="col-side">
+            <div class="card">
+              <h4>现场状态</h4>
+              <div id="rc-state-list"></div>
+            </div>
+            <!-- 本步票数（主持在未结算时可见；学员结算后看到上一步结果） -->
+            <div class="card" id="rc-tally-card">
+              <h4 id="rc-tally-title">本步票数</h4>
+              <div id="rc-tally-box"><div class="muted">—</div></div>
+            </div>
+            <div class="card hidden" id="rc-members-card">
+              <h4>成员与实时投票（仅主持可见）</h4>
+              <div id="rc-members-box"></div>
+            </div>
+            <div class="card">
+              <h4>已结算路径</h4>
+              <ol id="rc-path-list" class="path-list"></ol>
             </div>
           </div>
         </div>
